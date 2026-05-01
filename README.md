@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🎓 MemoSphere — Mobile Memo & Blogging App
 
 MemoSphere is a Flutter-based mobile application designed to help users create, manage, and share personal memos with a clean and modern interface.
@@ -53,3 +54,6 @@ The app works fully offline using local storage and supports image attachments a
 ```bash
 flutter pub get
 flutter run
+=======
+# memosphere
+>>>>>>> c3b0ebf083bb26e7d1b23e19218daf9dbdf08cb3
