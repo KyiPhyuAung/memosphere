@@ -95,11 +95,13 @@ class WelcomeScreen extends StatelessWidget {
 
 class _MemoSphereAppState extends State<MemoSphereApp> {
   bool isDark = false;
+  String? backgroundPath;
 
   @override
   void initState() {
     super.initState();
     loadSavedTheme();
+    loadSavedBackground();
   }
 
   Future<void> loadSavedTheme() async {
@@ -110,6 +112,24 @@ class _MemoSphereAppState extends State<MemoSphereApp> {
     setState(() {
       isDark = savedTheme;
     });
+  }
+
+  Future<void> loadSavedBackground() async {
+    final savedBackground = await DatabaseHelper.instance.readBackgroundPath();
+
+    if (!mounted) return;
+
+    setState(() {
+      backgroundPath = savedBackground;
+    });
+  }
+
+  Future<void> updateBackground(String? path) async {
+    setState(() {
+      backgroundPath = path;
+    });
+
+    await DatabaseHelper.instance.saveBackgroundPath(path);
   }
 
   Future<void> toggleTheme() async {
@@ -139,6 +159,8 @@ class _MemoSphereAppState extends State<MemoSphereApp> {
               builder: (_) => HomeScreen(
                 isDark: isDark,
                 onThemeChanged: toggleTheme,
+                backgroundPath: backgroundPath,
+                onBackgroundChanged: updateBackground,
               ),
             ),
           );
@@ -259,6 +281,7 @@ class Post {
   final String content;
   final String? imagePath;
   final String createdAt;
+  final bool isPinned;
 
   Post({
     this.id,
@@ -266,6 +289,7 @@ class Post {
     required this.content,
     this.imagePath,
     required this.createdAt,
+    this.isPinned = false,
   });
 
   Map<String, dynamic> toMap() {
@@ -275,6 +299,7 @@ class Post {
       'content': content,
       'imagePath': imagePath,
       'createdAt': createdAt,
+      'isPinned': isPinned ? 1 : 0,
     };
   }
 
@@ -285,6 +310,7 @@ class Post {
       content: map['content'],
       imagePath: map['imagePath'],
       createdAt: map['createdAt'],
+      isPinned: (map['isPinned'] ?? 0) == 1,
     );
   }
 }
@@ -303,7 +329,7 @@ class DatabaseHelper {
 
     _database = await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: _createDatabase,
       onUpgrade: _upgradeDatabase,
     );
@@ -318,7 +344,8 @@ class DatabaseHelper {
         title TEXT NOT NULL,
         content TEXT NOT NULL,
         imagePath TEXT,
-        createdAt TEXT NOT NULL
+        createdAt TEXT NOT NULL,
+        isPinned INTEGER NOT NULL DEFAULT 0
       )
     ''');
 
@@ -345,6 +372,12 @@ class DatabaseHelper {
         )
       ''');
     }
+
+    if (oldVersion < 4) {
+      await db.execute(
+        'ALTER TABLE posts ADD COLUMN isPinned INTEGER NOT NULL DEFAULT 0',
+      );
+    }
   }
 
   Future<bool> readDarkMode() async {
@@ -363,13 +396,42 @@ class DatabaseHelper {
   }
 
   Future<void> saveDarkMode(bool value) async {
+    await saveSetting('isDarkMode', value.toString());
+  }
+
+  Future<String?> readBackgroundPath() async {
+    final value = await readSetting('backgroundPath');
+    if (value == null || value.isEmpty) return null;
+    return value;
+  }
+
+  Future<void> saveBackgroundPath(String? path) async {
+    await saveSetting('backgroundPath', path ?? '');
+  }
+
+  Future<String?> readSetting(String key) async {
+    final db = await instance.database;
+
+    final result = await db.query(
+      'settings',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+
+    if (result.isEmpty) return null;
+    return result.first['value'] as String;
+  }
+
+  Future<void> saveSetting(String key, String value) async {
     final db = await instance.database;
 
     await db.insert(
       'settings',
       {
-        'key': 'isDarkMode',
-        'value': value.toString(),
+        'key': key,
+        'value': value,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
@@ -380,14 +442,14 @@ class DatabaseHelper {
     return db.insert('posts', post.toMap());
   }
 
-  Future<List<Post>> readPosts({String query = ''}) async {
+  Future<List<Post>> readPosts({String query = '', bool newestFirst = true}) async {
     final db = await instance.database;
 
     final result = await db.query(
       'posts',
       where: query.isEmpty ? null : 'title LIKE ? OR content LIKE ?',
       whereArgs: query.isEmpty ? null : ['%$query%', '%$query%'],
-      orderBy: 'id DESC',
+      orderBy: newestFirst ? 'isPinned DESC, id DESC' : 'isPinned DESC, id ASC',
     );
 
     return result.map((map) => Post.fromMap(map)).toList();
@@ -399,6 +461,17 @@ class DatabaseHelper {
     return db.update(
       'posts',
       post.toMap(),
+      where: 'id = ?',
+      whereArgs: [post.id],
+    );
+  }
+
+  Future<int> togglePin(Post post) async {
+    final db = await instance.database;
+
+    return db.update(
+      'posts',
+      {'isPinned': post.isPinned ? 0 : 1},
       where: 'id = ?',
       whereArgs: [post.id],
     );
@@ -430,11 +503,15 @@ class DatabaseHelper {
 class HomeScreen extends StatefulWidget {
   final bool isDark;
   final VoidCallback onThemeChanged;
+  final String? backgroundPath;
+  final ValueChanged<String?> onBackgroundChanged;
 
   const HomeScreen({
     super.key,
     required this.isDark,
     required this.onThemeChanged,
+    required this.backgroundPath,
+    required this.onBackgroundChanged,
   });
 
   @override
@@ -445,17 +522,24 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Post> posts = [];
   List<int> selectedIds = [];
   final TextEditingController searchController = TextEditingController();
+  final ImagePicker backgroundPicker = ImagePicker();
+  String? currentBackgroundPath;
+  bool newestFirst = true;
 
   bool get isSelectionMode => selectedIds.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
+    currentBackgroundPath = widget.backgroundPath;
     loadPosts();
   }
 
   Future<void> loadPosts({String query = ''}) async {
-    final data = await DatabaseHelper.instance.readPosts(query: query);
+    final data = await DatabaseHelper.instance.readPosts(
+      query: query,
+      newestFirst: newestFirst,
+    );
 
     setState(() {
       posts = data;
@@ -537,6 +621,36 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  Future<void> chooseCustomBackground() async {
+    final pickedImage = await backgroundPicker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+    );
+
+    if (pickedImage != null) {
+      setState(() {
+        currentBackgroundPath = pickedImage.path;
+      });
+      widget.onBackgroundChanged(pickedImage.path);
+    }
+  }
+
+  void removeCustomBackground() {
+    setState(() {
+      currentBackgroundPath = null;
+    });
+    widget.onBackgroundChanged(null);
+  }
+
+  void changeSortOrder(bool value) {
+    setState(() {
+      newestFirst = value;
+      selectedIds.clear();
+    });
+
+    loadPosts(query: searchController.text);
+  }
+
   Future<void> openAddScreen() async {
     await Navigator.push(
       context,
@@ -567,8 +681,10 @@ class _HomeScreenState extends State<HomeScreen> {
         icon: const Icon(Icons.add),
         label: const Text('✨ New Memo'),
       ),
-      body: SafeArea(
-        child: LayoutBuilder(
+      body: _HomeBackground(
+        backgroundPath: currentBackgroundPath,
+        child: SafeArea(
+          child: LayoutBuilder(
           builder: (context, constraints) {
             final isWide = constraints.maxWidth > 700;
 
@@ -585,15 +701,23 @@ class _HomeScreenState extends State<HomeScreen> {
                       _HeaderSection(
                         isDark: widget.isDark,
                         onThemeChanged: widget.onThemeChanged,
+                        hasCustomBackground: currentBackgroundPath != null,
+                        onChooseBackground: chooseCustomBackground,
+                        onRemoveBackground: removeCustomBackground,
                       ),
                       const SizedBox(height: 16),
                       TextField(
                         controller: searchController,
                         onChanged: (value) => loadPosts(query: value),
                         decoration: const InputDecoration(
-                          hintText: '🔍 Search your memos...',
+                          hintText: 'Search your memos...🔍',
                           prefixIcon: Icon(Icons.search),
                         ),
+                      ),
+                      const SizedBox(height: 12),
+                      _SortDropdown(
+                        newestFirst: newestFirst,
+                        onChanged: changeSortOrder,
                       ),
                       AnimatedSwitcher(
                         duration: const Duration(milliseconds: 220),
@@ -646,7 +770,76 @@ class _HomeScreenState extends State<HomeScreen> {
             );
           },
         ),
+        ),
       ),
+    );
+  }
+}
+
+
+class _HomeBackground extends StatelessWidget {
+  final String? backgroundPath;
+  final Widget child;
+
+  const _HomeBackground({
+    required this.backgroundPath,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final hasBackground =
+        backgroundPath != null && File(backgroundPath!).existsSync();
+
+    if (!hasBackground) {
+      return child;
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        image: DecorationImage(
+          image: FileImage(File(backgroundPath!)),
+          fit: BoxFit.cover,
+        ),
+      ),
+      child: Container(
+        color: Theme.of(context).scaffoldBackgroundColor.withOpacity(0.86),
+        child: child,
+      ),
+    );
+  }
+}
+
+class _SortDropdown extends StatelessWidget {
+  final bool newestFirst;
+  final ValueChanged<bool> onChanged;
+
+  const _SortDropdown({
+    required this.newestFirst,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownButtonFormField<bool>(
+      value: newestFirst,
+      decoration: const InputDecoration(
+        prefixIcon: Icon(Icons.sort),
+        contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      ),
+      items: const [
+        DropdownMenuItem(
+          value: true,
+          child: Text('Sort by last created'),
+        ),
+        DropdownMenuItem(
+          value: false,
+          child: Text('Sort by first created'),
+        ),
+      ],
+      onChanged: (value) {
+        if (value != null) onChanged(value);
+      },
     );
   }
 }
@@ -654,10 +847,16 @@ class _HomeScreenState extends State<HomeScreen> {
 class _HeaderSection extends StatelessWidget {
   final bool isDark;
   final VoidCallback onThemeChanged;
+  final bool hasCustomBackground;
+  final VoidCallback onChooseBackground;
+  final VoidCallback onRemoveBackground;
 
   const _HeaderSection({
     required this.isDark,
     required this.onThemeChanged,
+    required this.hasCustomBackground,
+    required this.onChooseBackground,
+    required this.onRemoveBackground,
   });
 
   @override
@@ -725,6 +924,28 @@ class _HeaderSection extends StatelessWidget {
                 ),
               ],
             ),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'Customize background',
+            icon: const Icon(Icons.wallpaper_outlined, color: Colors.white),
+            onSelected: (value) {
+              if (value == 'choose') {
+                onChooseBackground();
+              } else if (value == 'remove') {
+                onRemoveBackground();
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'choose',
+                child: Text('Choose background'),
+              ),
+              PopupMenuItem(
+                value: 'remove',
+                enabled: hasCustomBackground,
+                child: const Text('Remove background'),
+              ),
+            ],
           ),
           IconButton(
             tooltip: isDark ? 'Switch to light mode' : 'Switch to dark mode',
@@ -965,6 +1186,27 @@ class PostCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      Row(
+                        children: [
+                          if (post.isPinned) ...[
+                            Icon(
+                              Icons.push_pin,
+                              size: 16,
+                              color: Theme.of(context).colorScheme.primary,
+                            ),
+                            const SizedBox(width: 5),
+                          ],
+                          Text(
+                            post.isPinned ? 'Pinned Memo' : 'Memo',
+                            style: GoogleFonts.nunitoSans(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w900,
+                              color: Theme.of(context).colorScheme.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 5),
                       Text(
                         post.title,
                         maxLines: 1,
@@ -1086,6 +1328,7 @@ class _AddEditPostScreenState extends State<AddEditPostScreen> {
         content: content,
         imagePath: imagePath,
         createdAt: widget.post!.createdAt,
+        isPinned: widget.post!.isPinned,
       );
 
       await DatabaseHelper.instance.updatePost(updatedPost);
@@ -1257,13 +1500,49 @@ class _AddEditPostScreenState extends State<AddEditPostScreen> {
   }
 }
 
-class DetailScreen extends StatelessWidget {
+class DetailScreen extends StatefulWidget {
   final Post post;
 
   const DetailScreen({
     super.key,
     required this.post,
   });
+
+  @override
+  State<DetailScreen> createState() => _DetailScreenState();
+}
+
+class _DetailScreenState extends State<DetailScreen> {
+  late Post post;
+
+  @override
+  void initState() {
+    super.initState();
+    post = widget.post;
+  }
+
+  Future<void> togglePin() async {
+    await DatabaseHelper.instance.togglePin(post);
+
+    setState(() {
+      post = Post(
+        id: post.id,
+        title: post.title,
+        content: post.content,
+        imagePath: post.imagePath,
+        createdAt: post.createdAt,
+        isPinned: !post.isPinned,
+      );
+    });
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(post.isPinned ? 'Memo pinned.' : 'Memo unpinned.'),
+        ),
+      );
+    }
+  }
 
   Future<void> deletePost(BuildContext context) async {
     final shouldDelete = await showDialog<bool>(
@@ -1332,6 +1611,13 @@ class DetailScreen extends StatelessWidget {
         title: const Text('📖 Memo Detail'),
         actions: [
           IconButton(
+            tooltip: post.isPinned ? 'Unpin memo' : 'Pin memo',
+            onPressed: togglePin,
+            icon: Icon(
+              post.isPinned ? Icons.push_pin : Icons.push_pin_outlined,
+            ),
+          ),
+          IconButton(
             onPressed: sharePost,
             icon: const Icon(Icons.share_outlined),
           ),
@@ -1387,6 +1673,28 @@ class DetailScreen extends StatelessWidget {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
+                            if (post.isPinned)
+                              Container(
+                                margin: const EdgeInsets.only(bottom: 10),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .primary
+                                      .withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                                child: Text(
+                                  '📌 Pinned',
+                                  style: GoogleFonts.nunitoSans(
+                                    fontWeight: FontWeight.w900,
+                                    color: Theme.of(context).colorScheme.primary,
+                                  ),
+                                ),
+                              ),
                             Text(
                               post.title,
                               style: GoogleFonts.spaceGrotesk(
